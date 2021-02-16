@@ -328,7 +328,7 @@ class Alphafold2(nn.Module):
         # multiple sequence alignment position embedding
 
         self.msa_pos_emb = nn.Embedding(max_seq_len, dim)
-        self.msa_num_pos_emb = nn.Embedding(constants.MAX_NUM_MSA, dim)
+        self.msa_num_pos_emb = nn.Embedding(constants.MAX_NUM_MSA_EXP, dim)
 
         # custom embedding projection
 
@@ -379,7 +379,7 @@ class Alphafold2(nn.Module):
             nn.Linear(dim, constants.DISTOGRAM_BUCKETS)
         )
 
-    def forward(self, seq, msa = None, embedds = None, mask = None, msa_mask = None, ss_only = False):
+    def forward(self, seq, msa = None, embedds = None, mask = None, msa_mask = None, ss_only = False, msa_row_pos = 0, seq_pos = 0):
         n, device = seq.shape[1], seq.device
 
         # unpack (AA_code, atom_pos)
@@ -393,7 +393,7 @@ class Alphafold2(nn.Module):
 
         # use axial positional embedding
 
-        seq_range = torch.arange(n, device = device)
+        seq_range = torch.arange(start = seq_pos, end = seq_pos + n, device = device)
         ax1 = x + self.pos_emb(seq_range)[None, ...]
         ax2 = x + self.pos_emb_ax(seq_range)[None, ...]
 
@@ -402,6 +402,7 @@ class Alphafold2(nn.Module):
         x = rearrange(ax1, 'b i d -> b i () d') + rearrange(ax2, 'b j d-> b () j d') # create pair-wise residue embeds
         x_mask = rearrange(mask, 'b i -> b i ()') + rearrange(mask, 'b j -> b () j') if exists(mask) else None
 
+        seq_shape = x.shape
         x = rearrange(x, 'b i j d -> b (i j) d')
         x_mask = rearrange(x_mask, 'b i j -> b (i j)') if exists(mask) else None
 
@@ -409,12 +410,11 @@ class Alphafold2(nn.Module):
 
         m = None
         if exists(msa):
-            msa_shape = msa.shape
-
             m = self.token_emb(msa)
-            m += self.msa_pos_emb(torch.arange(msa_shape[-1], device = device))[None, None, ...]
-            m += self.msa_num_pos_emb(torch.arange(msa_shape[1], device = device))[None, :, None, :]
+            m += self.msa_pos_emb(torch.arange(start = seq_pos, end = seq_pos + msa.shape[-1], device = device))[None, None, ...]
+            m += self.msa_num_pos_emb(torch.arange(start = msa_row_pos, end = msa_row_pos + msa.shape[1], device = device))[None, :, None, :]
 
+            msa_shape = m.shape
             m = rearrange(m, 'b m n d -> b (m n) d')
 
         elif exists(embedds):
@@ -436,7 +436,7 @@ class Alphafold2(nn.Module):
         x, m = self.net(x, m, mask = x_mask, msa_mask = msa_mask, msa_lead_dims = msa_lead_dims)
 
         if (ss_only):
-            return x, m, n
+            return x, m, n, seq_pos
 
         # structural refinement
 

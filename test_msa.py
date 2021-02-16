@@ -1,5 +1,4 @@
-
-from alphafold2_pytorch.alphafold2 import Attention, exists, partial, PreNorm, FeedForward
+from alphafold2_pytorch.alphafold2 import exists, partial, PreNorm, FeedForward
 from alphafold2_pytorch import constants
 from pathlib import Path
 
@@ -15,7 +14,7 @@ from alphafold2_pytorch import Alphafold2
 
 # n: 20171106 : changed-to: '.' = 0
 AA = {
-    '.': 0,
+    '.': 32,
     'A': 1,
     'C': 2,
     'D': 3,
@@ -44,7 +43,6 @@ AA = {
     'Z': 21,
 }
 
-NUM_BATCHES = int(1e5)
 GRADIENT_ACCUMULATE_EVERY = 16
 LEARNING_RATE = 3e-5
 NUM_SS_CLASS = 3
@@ -164,20 +162,6 @@ class SSModule(nn.Module):
         return x
 
 
-class SSWrapper(nn.Module):
-    """due to the nature of available msa->sst training data, forward need to handle per amino acid position logic
-    thus we create a wrapper largely duplicate alphafold2's forward but with modification
-    """
-    def __init__(self, num_class, **kwargs):
-        super().__init__()
-        self.af2 = Alphafold2(**kwargs)
-        self.ssp = SSModule(num_class, **kwargs)
-
-    def forward(self, **kwargs):
-        x,*_ = self.af2(**kwargs)
-        # print(f'post_af2: x.shape -> {x.shape}')
-        return self.ssp(x)
-
 
 def rand_choice(orginal_size: int, target_size: int, container):
     idxs = np.random.choice(orginal_size, target_size)
@@ -185,23 +169,30 @@ def rand_choice(orginal_size: int, target_size: int, container):
     return idxs
 
 
+def rand_chunk(max_depth, size, container):
+    start = np.random.randint(low=0, high=max_depth - size - 1)
+    res = range(start, start + size)
+    container.extend([start])
+    return res
+
+
 def test(root: str):
     root = Path(root)
     device = torch.device('cuda:0')
     ds = SampleHackDataset(root / "sample.csv", root / "msa", root / "seq", root / "sst")
-    model = SSWrapper(
-        num_class=3,
+    af2 = Alphafold2(
         dim=256,
         depth=12,
         heads=8,
         dim_head=64,
-        num_tokens = constants.NUM_AMINO_ACIDS_EXP,
-        sparse_self_attn = (True, False) * 3,
+        num_tokens=constants.NUM_AMINO_ACIDS_EXP,
+        sparse_self_attn=(True, False) * 3,
         cross_attn_compress_ratio=3,
         reversible=True,
     ).cuda()
+    ssp = SSModule(num_class=NUM_SS_CLASS).cuda()
 
-    optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optim = torch.optim.Adam(list(af2.parameters()) + list(ssp.parameters()), lr=LEARNING_RATE)
     lossFn = nn.CrossEntropyLoss()
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter()
@@ -234,18 +225,18 @@ def test(root: str):
         # msa = pad(msa, MAX_SEQ_LEN, b, seq_len, msa_depth=msa_depth)
         # sst = pad(sst, MAX_SEQ_LEN, b, seq_len)
 
-        idxs = []
-        l = 64
+        l = 256
         k = np.math.ceil(seq_len / l)
         r_k = k * l - seq_len
-        id_extension_list = [f"{id}_w{ch_i}" for ch_i in range(k)]
+        id_extension_list = [f"{id}_k{ch_i}" for ch_i in range(k)]
         seq = torch.nn.functional.pad(seq, (0, r_k))
         seq = torch.tensor([[chunk for chunk in seq[i * l:(i + 1) * l]] for i in range(k)])
-        d = 8
+        d = 4
         msa = torch.nn.functional.pad(msa, (0, r_k))
+        msa_row_idxs = []
         msa = torch.tensor(
             [
-                [[chunk for chunk in _seq[i * l:(i + 1) * l]] for _seq in msa[rand_choice(msa_depth, d, idxs)]]
+                [[chunk for chunk in _seq[i * l:(i + 1) * l]] for _seq in msa[rand_chunk(msa_depth, d, msa_row_idxs)]]
                 for i in range(k)
             ]
         )
@@ -258,18 +249,17 @@ def test(root: str):
         tloss = 0
         for i in range(k):
             n_seq, n_msa, cut_off = reshape_input(seq, msa, sst, i)
-            ss, ss_t = reshape_output(model, sst, i, n_seq, n_msa, cut_off)
+            trunk,_,_,_ = af2(seq=n_seq, msa=n_msa, ss_only=True, msa_row_pos=msa_row_idxs[i], seq_pos=i * l)
+            ss = ssp(trunk)
+            ss, ss_t = reshape_output(sst, i, cut_off, ss)
             loss = lossFn(ss, ss_t)
             tloss += loss
-            
+
         write_loss(writer, global_counter, id, tloss)
         tloss.backward()
         global_counter += 1
-        
-        if accumulated_enough(GRADIENT_ACCUMULATE_EVERY, gradient_counter):
-            gradient_counter = 0
-            optim.step()
-            optim.zero_grad()
+        optim.step()
+        optim.zero_grad()
 
 
 def write_loss(writer, global_counter, id, tloss):
@@ -277,15 +267,14 @@ def write_loss(writer, global_counter, id, tloss):
     writer.add_text("Data id", f"{id}", global_step=global_counter)
 
 
-def reshape_output(model, sst, i, n_seq, n_msa, cut_off):
-    ss = model(seq=n_seq, msa=n_msa, ss_only=True)
-    ss = rearrange(ss, 'b n c -> b c n', c=NUM_SS_CLASS)
-    ss = rearrange(ss, 'b c n -> n b c')
+def reshape_output(sst, i, cut_off, ss):
+    ss = rearrange(ss, 'b n c -> n b c', c=NUM_SS_CLASS)
     ss = ss[:cut_off, ...]
     ss = rearrange(ss, 'n b c -> b c n')
     ss_t = sst[i][:cut_off]
     ss_t = rearrange(ss_t, 'l -> () l').cuda()
-    return ss,ss_t
+    return ss, ss_t
+
 
 def reshape_input(seq, msa, sst, i):
     n_seq = rearrange(seq[i], 'l -> () l').cuda()
@@ -295,7 +284,7 @@ def reshape_input(seq, msa, sst, i):
     for z in range(len(valid)):
         if valid[z]:
             cut_off = z
-    return n_seq,n_msa,cut_off
+    return n_seq, n_msa, cut_off
 
 
 if __name__ == '__main__':
